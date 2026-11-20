@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+<title>Pocketframe</title>
+<meta name="description" content="A small photo generator that runs on your own phone. Prompts and images never leave the device.">
+<meta name="theme-color" content="#15100e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* A print darkroom: umber walls, paper-white prints, amber safelight. */
+    --wall: #15100e;
+    --tray: #211815;
+    --tray-lift: #2c211c;
+    --edge: #43322a;
+    --paper: #f4ebdd;
+    --ink: #1d1512;
+    --ink-soft: #6b5a4f;
+    --dust: #ab998b;
+    --safelight: #ffae2b;
+    --safelight-deep: #d98600;
+    --stop: #f0705c;
+    --radius: 12px;
+    --type: "Bricolage Grotesque", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--wall);
+    color: var(--paper);
+    font-family: var(--type);
+    font-size: 16px;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  button, select, textarea, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--safelight); outline-offset: 2px; }
+  [hidden] { display: none !important; }
+
+  /* ---------- header ---------- */
+  .top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px 10px;
+  }
+  .wordmark {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 750;
+    letter-spacing: -0.035em;
+    font-variation-settings: "opsz" 96;
+    line-height: 1;
+  }
+  .engine-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 6px 14px 6px 12px;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    background: transparent;
+    font-size: 0.875rem;
+    font-weight: 550;
+  }
+  .lamp {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--dust);
+  }
+  .engine-button[data-state="ready"] .lamp { background: var(--safelight); box-shadow: 0 0 10px 1px rgba(255, 174, 43, .65); }
+  .engine-button[data-state="busy"] .lamp { background: var(--safelight); animation: lamp 1.1s ease-in-out infinite alternate; }
+  .engine-button[data-state="problem"] .lamp { background: var(--stop); }
+  @keyframes lamp { from { opacity: .25; } to { opacity: 1; } }
+
+  /* ---------- layout ---------- */
+  .stage {
+    flex: 1;
+    width: 100%;
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 6px 16px 20px;
+  }
+  .dock {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--tray);
+    border-top: 1px solid var(--edge);
+    padding: 10px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+  .dock-inner { max-width: 560px; margin: 0 auto; }
+
+  /* ---------- the print ---------- */
+  .print {
+    background: var(--paper);
+    color: var(--ink);
+    padding: 10px 10px 0;
+    border-radius: 3px;
+    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 18px 40px -18px rgba(0,0,0,.9);
+  }
+  .print-window {
+    position: relative;
+    aspect-ratio: 1 / 1;
+    background: #e6dccb;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+  .print-window img {
+    width: 100%; height: 100%;
+    display: block;
+    object-fit: cover;
+  }
+  .print-window img.developing { animation: develop 1.15s cubic-bezier(.2,.7,.2,1) both; }
+  @keyframes develop {
+    from { opacity: 0; filter: blur(7px) sepia(.9) contrast(.75) brightness(1.25); }
+    60%  { opacity: 1; filter: blur(1px) sepia(.4) contrast(.92) brightness(1.06); }
+    to   { opacity: 1; filter: none; }
+  }
+  .print-caption {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 38px;
+    align-items: center;
+    padding: 0 2px;
+    font-size: 0.8125rem;
+    color: var(--ink-soft);
+  }
+  .print-caption strong { color: var(--ink); font-weight: 650; }
+
+  .print-note {
+    padding: 22px 22px;
+    max-width: 30em;
+    text-align: left;
+    justify-self: stretch;
+  }
+  .print-note h2 {
+    margin: 0 0 8px;
+    font-size: 1.375rem;
+    line-height: 1.15;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+  }
+  .print-note p { margin: 0 0 12px; color: #4a3b33; font-size: 0.9375rem; }
+  .print-note p:last-child { margin-bottom: 0; }
+  .print-note details { margin-top: 10px; font-size: 0.8125rem; color: var(--ink-soft); }
+  .print-note details pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; font-size: 0.75rem; }
+
+  .checks { list-style: none; margin: 0 0 14px; padding: 0; font-size: 0.875rem; color: #4a3b33; }
+  .checks li { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+  .checks .mark { width: 1.1em; font-weight: 700; flex: none; }
+  .checks .ok .mark { color: #2f7d4f; }
+  .checks .bad .mark { color: #b3311f; }
+
+  .meter {
+    height: 6px;
+    background: rgba(29, 21, 18, .14);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 12px 0 8px;
+  }
+  .meter span { display: block; height: 100%; width: 0%; background: var(--ink); border-radius: 3px; transition: width .25s linear; }
+  .meter.indeterminate span { width: 35%; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-110%); } to { transform: translateX(300%); } }
+  .meter-line { display: flex; justify-content: space-between; gap: 10px; font-size: 0.8125rem; color: var(--ink-soft); }
+
+  .examples { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .example {
+    text-align: left;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(29, 21, 18, .22);
+    background: rgba(255, 255, 255, .35);
+    color: var(--ink);
+    font-size: 0.875rem;
+    line-height: 1.3;
+  }
+
+  /* ---------- buttons ---------- */
+  .btn {
+    min-height: 44px;
+    padding: 9px 16px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    font-weight: 650;
+    font-size: 0.9375rem;
+  }
+  .btn-ink { background: var(--ink); color: var(--paper); }
+  .btn-paper-outline { background: transparent; color: var(--ink); border-color: rgba(29, 21, 18, .35); }
+  .btn-quiet { background: transparent; color: var(--paper); border-color: var(--edge); }
+  .btn-danger { background: transparent; color: var(--stop); border-color: rgba(240, 112, 92, .45); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  .print-actions { margin-top: 12px; }
+  .print-actions .btn { flex: 1 1 0; min-width: 0; padding-left: 8px; padding-right: 8px; }
+
+  .used-prompt { margin: 12px 2px 0; color: var(--dust); font-size: 0.875rem; }
+
+  /* ---------- contact strip ---------- */
+  .strip-head { display: flex; justify-content: space-between; align-items: baseline; margin: 22px 2px 8px; }
+  .strip-head h2 { margin: 0; font-size: 1rem; font-weight: 650; }
+  .strip-head span { color: var(--dust); font-size: 0.8125rem; }
+  .strip { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 10px; scrollbar-width: thin; scrollbar-color: var(--edge) transparent; }
+  .frame {
+    flex: none;
+    padding: 0;
+    border: 0;
+    background: none;
+    display: grid;
+    gap: 4px;
+    justify-items: center;
+    color: var(--dust);
+    font-size: 0.75rem;
+  }
+  .frame img {
+    width: 76px; height: 76px;
+    object-fit: cover;
+    display: block;
+    border: 4px solid var(--paper);
+    border-radius: 2px;
+  }
+  .frame[aria-current="true"] img { outline: 2px solid var(--safelight); outline-offset: 2px; }
+  .frame[aria-current="true"] { color: var(--safelight); }
+
+  /* ---------- dock ---------- */
+  .options { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-bottom: 10px; }
+  .option { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8125rem; color: var(--dust); }
+  .option select {
+    appearance: none;
+    min-height: 36px;
+    padding: 4px 28px 4px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--edge);
+    background: var(--tray-lift) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23ab998b' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 11px center;
+    color: var(--paper);
+    font-weight: 550;
+    font-size: 0.875rem;
+    max-width: 11.5rem;
+  }
+  .seg { display: inline-flex; border: 1px solid var(--edge); border-radius: 999px; overflow: hidden; background: var(--tray-lift); }
+  .seg button {
+    min-width: 36px; min-height: 36px;
+    padding: 0 10px;
+    border: 0;
+    background: transparent;
+    font-weight: 600;
+    font-size: 0.875rem;
+    color: var(--dust);
+  }
+  .seg button[aria-pressed="true"] { background: var(--paper); color: var(--ink); }
+  .seed-toggle {
+    min-height: 36px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--edge);
+    background: var(--tray-lift);
+    font-weight: 550;
+    font-size: 0.875rem;
+  }
+  .seed-toggle[aria-pressed="true"] { border-color: var(--safelight); color: var(--safelight); }
+  .seed-input {
+    width: 7.5rem; min-height: 36px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--edge);
+    background: var(--wall);
+    font-size: 0.875rem;
+  }
+
+  .compose { display: flex; gap: 10px; align-items: stretch; }
+  .compose textarea {
+    flex: 1;
+    min-height: 68px;
+    max-height: 30dvh;
+    resize: none;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    border: 1px solid var(--edge);
+    background: var(--wall);
+    font-size: 1rem;
+    line-height: 1.35;
+  }
+  .compose textarea::placeholder { color: #7d6c60; }
+  .go {
+    flex: none;
+    width: 104px;
+    border: 0;
+    border-radius: var(--radius);
+    background: var(--safelight);
+    color: var(--ink);
+    font-weight: 750;
+    font-size: 1rem;
+    letter-spacing: -0.01em;
+  }
+  .go:active { background: var(--safelight-deep); }
+  .go:disabled { background: #5a4a3f; color: #a8978a; cursor: default; }
+  .go[data-mode="stop"] { background: transparent; color: var(--stop); box-shadow: inset 0 0 0 1.5px var(--stop); }
+  .hint { margin: 8px 2px 0; min-height: 1.2em; font-size: 0.8125rem; color: var(--dust); }
+  .hint.warn { color: var(--safelight); }
+
+  /* ---------- engine panel ---------- */
+  dialog {
+    width: min(480px, calc(100vw - 24px));
+    max-height: calc(100dvh - 24px);
+    padding: 0;
+    border: 1px solid var(--edge);
+    border-radius: 16px;
+    background: var(--tray);
+    color: var(--paper);
+  }
+  dialog::backdrop { background: rgba(8, 5, 4, .72); }
+  .panel { padding: 20px; display: grid; gap: 16px; }
+  .panel h2 { margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
+  .panel h3 { margin: 0 0 6px; font-size: 0.9375rem; font-weight: 650; }
+  .panel p { margin: 0; color: var(--dust); font-size: 0.9rem; }
+  .panel a { color: var(--safelight); }
+  .facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 0.9rem; }
+  .facts dt { color: var(--dust); }
+  .facts dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+  .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .panel hr { border: 0; border-top: 1px solid var(--edge); margin: 0; width: 100%; }
+
+  .toast {
+    position: fixed;
+    left: 50%; bottom: 190px;
+    transform: translateX(-50%);
+    background: var(--paper);
+    color: var(--ink);
+    padding: 9px 16px;
+    border-radius: 999px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    z-index: 20;
+    box-shadow: 0 10px 30px -10px rgba(0,0,0,.8);
+  }
+
+  /* ---------- wide screens ---------- */
+  @media (min-width: 940px) {
+    body { display: grid; grid-template-columns: 400px minmax(0, 1fr); grid-template-rows: auto 1fr; column-gap: 8px; max-width: 1180px; margin: 0 auto; }
+    .top { grid-column: 1 / -1; padding: 22px 28px 14px; }
+    .dock { grid-column: 1; grid-row: 2; position: sticky; top: 16px; align-self: start; margin: 0 0 0 28px; border: 1px solid var(--edge); border-radius: 16px; padding: 18px; }
+    .stage { grid-column: 2; grid-row: 2; max-width: 600px; padding: 0 28px 40px; }
+    .compose { flex-direction: column; }
+    .compose textarea { min-height: 140px; max-height: none; }
+    .go { width: 100%; min-height: 52px; }
+    .strip { flex-wrap: wrap; overflow: visible; }
+    .toast { bottom: 32px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .print-window img.developing { animation: none; }
+    .engine-button[data-state="busy"] .lamp { animation: none; }
+    .meter.indeterminate span { animation: none; width: 100%; opacity: .4; }
+    .meter span { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1 class="wordmark">Pocketframe</h1>
+  <button class="engine-button" id="engineButton" type="button" data-state="idle" aria-haspopup="dialog">
+    <span class="lamp" aria-hidden="true"></span><span id="engineLabel">Checking</span>
+  </button>
+</header>
+
+<main class="stage">
+  <section class="print" aria-label="Current photo">
+    <div class="print-window" id="printWindow">
+      <!-- filled by app.js -->
+      <div class="print-note"><h2>Checking this device</h2><p>One moment.</p></div>
+    </div>
+    <div class="print-caption" id="printCaption" aria-live="polite"><span>512 × 512</span><span></span></div>
+  </section>
+
+  <div class="row print-actions" id="printActions" hidden>
+    <button class="btn btn-quiet" id="saveButton" type="button">Save</button>
+    <button class="btn btn-quiet" id="shareButton" type="button">Share</button>
+    <button class="btn btn-quiet" id="reuseButton" type="button">Reuse</button>
+    <button class="btn btn-danger" id="deleteButton" type="button">Delete</button>
+  </div>
+  <p class="used-prompt" id="usedPrompt" hidden></p>
+
+  <section id="stripSection" hidden>
+    <div class="strip-head"><h2>Photos on this device</h2><span id="stripCount"></span></div>
+    <div class="strip" id="strip"></div>
+  </section>
+</main>
+
+<form class="dock" id="dock" autocomplete="off">
+  <div class="dock-inner">
+    <div class="options">
+      <label class="option">Style
+        <select id="styleSelect" aria-label="Style"></select>
+      </label>
+      <span class="option" id="stepsLabel">Steps
+        <span class="seg" role="group" aria-labelledby="stepsLabel" id="stepsSeg">
+          <button type="button" data-value="1">1</button>
+          <button type="button" data-value="2">2</button>
+          <button type="button" data-value="4">4</button>
+        </span>
+      </span>
+      <span class="option" id="countLabel">Photos
+        <span class="seg" role="group" aria-labelledby="countLabel" id="countSeg">
+          <button type="button" data-value="1">1</button>
+          <button type="button" data-value="2">2</button>
+          <button type="button" data-value="4">4</button>
+        </span>
+      </span>
+      <button class="seed-toggle" id="seedToggle" type="button" aria-pressed="false">Random seed</button>
+      <input class="seed-input" id="seedInput" type="number" inputmode="numeric" min="0" max="4294967295" step="1" aria-label="Seed" hidden>
+    </div>
+    <div class="compose">
+      <textarea id="prompt" rows="2" placeholder="Describe the photo" aria-label="Prompt" enterkeyhint="go"></textarea>
+      <button class="go" id="goButton" type="submit" disabled>Generate</button>
+    </div>
+    <p class="hint" id="hint" aria-live="polite"></p>
+  </div>
+</form>
+
+<dialog id="enginePanel" aria-labelledby="engineTitle">
+  <div class="panel">
+    <div class="panel-head">
+      <h2 id="engineTitle">Engine</h2>
+      <button class="btn btn-quiet" id="closePanel" type="button">Close</button>
+    </div>
+    <dl class="facts" id="facts"></dl>
+    <div class="row">
+      <button class="btn btn-quiet" id="unloadButton" type="button">Free memory</button>
+      <button class="btn btn-quiet" id="reportButton" type="button">Copy device report</button>
+    </div>
+    <hr>
+    <div>
+      <h3>Model on this device</h3>
+      <p id="modelLine"></p>
+    </div>
+    <div class="row">
+      <button class="btn btn-danger" id="deleteModelButton" type="button">Delete model</button>
+    </div>
+    <hr>
+    <div>
+      <h3>About the model</h3>
+      <p>Pocketframe runs SD-Turbo by Stability AI, converted for browsers. Its licence covers personal and research use only, not commercial use. <a href="https://huggingface.co/stabilityai/sd-turbo" target="_blank" rel="noopener">Model page and licence</a></p>
+    </div>
+    <div>
+      <h3>Privacy</h3>
+      <p>Prompts and photos stay in this browser. The only downloads are the model files and the engine code.</p>
+    </div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

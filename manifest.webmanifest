@@ -1,0 +1,13 @@
+{
+  "name": "Pocketframe",
+  "short_name": "Pocketframe",
+  "description": "A small photo generator that runs on your own device.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#15100e",
+  "theme_color": "#15100e",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
