@@ -32,7 +32,7 @@ const READ_SLICE = 64 * 1024 * 1024;
 
 let config = { local: false, backend: 'webgpu' };
 let ort = null;
-let sessions = null;
+let sessions = {};
 let tokenizer = null;
 let downloadAbort = null;
 let cancelGeneration = false;
@@ -355,65 +355,43 @@ function sessionOptions(overrides) {
   };
 }
 
-const SESSION_PLAN = [
-  // Largest first: peak memory is lowest when nothing else is loaded yet.
-  { key: 'unet', overrides: { batch_size: 1, num_channels: 4, height: LATENT, width: LATENT, sequence_length: 77, steps: 1 } },
-  { key: 'text_encoder', overrides: { batch_size: 1, sequence_length: 77 } },
-  { key: 'vae_decoder', overrides: { batch_size: 1, num_channels_latent: 4, height_latent: LATENT, width_latent: LATENT } },
-];
+const SESSION_OVERRIDES = {
+  unet: { batch_size: 1, num_channels: 4, height: LATENT, width: LATENT, sequence_length: 77, steps: 1 },
+  text_encoder: { batch_size: 1, sequence_length: 77 },
+  vae_decoder: { batch_size: 1, num_channels_latent: 4, height_latent: LATENT, width_latent: LATENT },
+};
 
 async function loadBytes(key) {
   return readStored(FILES.find((f) => f.key === key));
 }
 
-// Reads one stored model as { graph, weights }: a small graph whose weights
-// point into the original file, plus that file's bytes. Loading it this way
-// keeps the engine's own working memory small (see onnx-external.js).
-async function loadModelParts(key) {
-  const file = FILES.find((f) => f.key === key);
-  const location = `${key}.bin`;
-  const access = await openFile(file, false);
-  try {
-    const size = access.getSize();
-    if (size !== file.bytes) {
-      throw new EngineError('not_downloaded', 'The model download is incomplete.');
-    }
-    let graph;
-    try {
-      graph = externalizeWeights((at, length) => {
-        const chunk = new Uint8Array(length);
-        access.read(chunk, { at });
-        return chunk;
-      }, size, location).graph;
-    } catch (err) {
-      throw new EngineError('engine_load', 'A model file could not be read.', String(err && err.message || err));
-    }
-    let weights;
-    try {
-      weights = new Uint8Array(size);
-    } catch {
-      throw new EngineError('memory', 'Not enough free memory to load the model.');
-    }
-    for (let at = 0; at < size; at += READ_SLICE) {
-      const end = Math.min(size, at + READ_SLICE);
-      const got = access.read(weights.subarray(at, end), { at });
-      if (got !== end - at) throw new EngineError('engine_load', 'A model file could not be read back.');
-    }
-    return { graph, weights, location };
-  } finally {
-    access.close();
-  }
+// A stand-in for "the whole weights file in memory". The engine only ever asks
+// a mounted file for its size and for one slice at a time (one weight), so
+// each slice is read from storage on demand and nothing large stays in memory.
+// (Checked against ONNX Runtime Web 1.31.1, which this page pins.)
+function fileOnDemand(access, size, onRead) {
+  const file = Object.create(Uint8Array.prototype);
+  Object.defineProperty(file, 'byteLength', { value: size });
+  Object.defineProperty(file, 'length', { value: size });
+  Object.defineProperty(file, 'subarray', {
+    value(start, end) {
+      const chunk = new Uint8Array(end - start);
+      const got = access.read(chunk, { at: start });
+      if (got !== chunk.length) throw new Error('A model file could not be read back.');
+      onRead(chunk.length);
+      return chunk;
+    },
+  });
+  return file;
 }
 
-async function load() {
-  if (sessions) return { loaded: true };
+async function ensureRuntime() {
   if (!hasPrivateStorage()) {
     throw new EngineError('no_storage', 'This browser cannot keep large files for a website.');
   }
   const status = await downloadStatus();
   if (!status.complete) throw new EngineError('not_downloaded', 'Download the model first.');
 
-  emit('load-progress', { stage: 'runtime', done: 0, of: SESSION_PLAN.length });
   if (!ort) {
     const url = config.local
       ? new URL('./ortdist/ort.webgpu.bundle.min.mjs', import.meta.url).href
@@ -433,63 +411,105 @@ async function load() {
     const merges = decoder.decode(await loadBytes('merges'));
     tokenizer = new ClipTokenizer(vocab, merges);
   }
-
-  const built = {};
-  try {
-    for (let i = 0; i < SESSION_PLAN.length; i++) {
-      const plan = SESSION_PLAN[i];
-      emit('load-progress', { stage: plan.key, done: i, of: SESSION_PLAN.length });
-      let parts = await loadModelParts(plan.key);
-      built[plan.key] = await ort.InferenceSession.create(parts.graph, {
-        ...sessionOptions(plan.overrides),
-        externalData: [{ path: parts.location, data: parts.weights }],
-      });
-      parts = null; // let the copy in page memory go as soon as the engine has it
-    }
-  } catch (err) {
-    for (const s of Object.values(built)) {
-      try { await s.release(); } catch { /* already gone */ }
-    }
-    if (err instanceof EngineError) throw err;
-    const text = String(err && err.message || err);
-    if (/f16/i.test(text)) {
-      throw new EngineError('no_f16', 'This graphics chip lacks a feature the model needs (16-bit shader maths).', text);
-    }
-    if (/memory|alloc|oom/i.test(text)) {
-      throw new EngineError('memory', 'The phone ran out of memory while loading the model.', text);
-    }
-    throw new EngineError('engine_load', 'The model could not be loaded onto the graphics chip.', text);
-  }
-  sessions = built;
-  emit('load-progress', { stage: 'done', done: SESSION_PLAN.length, of: SESSION_PLAN.length });
   return { loaded: true };
 }
 
-async function unload() {
-  const current = sessions;
-  sessions = null;
-  promptCache.clear();
-  if (!current) return;
-  for (const s of Object.values(current)) {
-    try { await s.release(); } catch { /* already gone */ }
+// Loads one model onto the graphics chip, unless it is already there.
+// The stored file is split into a small graph plus weight references (see
+// onnx-external.js) and the weights are streamed from storage one at a time.
+async function ensureSession(key) {
+  if (sessions[key]) return sessions[key];
+  const file = FILES.find((f) => f.key === key);
+  const location = `${key}.bin`;
+  emit('model-progress', { key, phase: 'read', sent: 0, total: file.bytes });
+
+  const access = await openFile(file, false);
+  try {
+    const size = access.getSize();
+    if (size !== file.bytes) {
+      throw new EngineError('not_downloaded', 'The model download is incomplete.');
+    }
+    let graph;
+    try {
+      graph = externalizeWeights((at, length) => {
+        const chunk = new Uint8Array(length);
+        access.read(chunk, { at });
+        return chunk;
+      }, size, location).graph;
+    } catch (err) {
+      throw new EngineError('engine_load', 'A model file could not be read.', String(err && err.message || err));
+    }
+
+    let sent = 0;
+    let lastReport = 0;
+    const weights = fileOnDemand(access, size, (n) => {
+      sent += n;
+      if (sent - lastReport >= 24 * 1024 * 1024) {
+        lastReport = sent;
+        emit('model-progress', { key, phase: 'upload', sent, total: file.bytes });
+      }
+    });
+
+    emit('model-progress', { key, phase: 'upload', sent: 0, total: file.bytes });
+    try {
+      sessions[key] = await ort.InferenceSession.create(graph, {
+        ...sessionOptions(SESSION_OVERRIDES[key]),
+        externalData: [{ path: location, data: weights }],
+      });
+    } catch (err) {
+      if (err instanceof EngineError) throw err;
+      const text = String(err && err.message || err);
+      if (/f16/i.test(text)) {
+        throw new EngineError('no_f16', 'This graphics chip lacks a feature the model needs (16-bit shader maths).', text);
+      }
+      if (/memory|alloc|oom/i.test(text)) {
+        throw new EngineError('memory', 'The device ran out of memory while loading the model.', text);
+      }
+      throw new EngineError('engine_load', 'The model could not be loaded onto the graphics chip.', text);
+    }
+  } finally {
+    access.close();
   }
+  emit('model-progress', { key, phase: 'done', sent: file.bytes, total: file.bytes });
+  return sessions[key];
+}
+
+async function closeSession(key) {
+  const session = sessions[key];
+  if (!session) return;
+  delete sessions[key];
+  try { await session.release(); } catch { /* already gone */ }
+}
+
+async function unload() {
+  promptCache.clear();
+  for (const key of Object.keys(sessions)) await closeSession(key);
 }
 
 function checkCancelled() {
   if (cancelGeneration) throw new EngineError('cancelled', 'Stopped.');
 }
 
+// The prompt reader is only needed for a moment per new prompt, so it is
+// loaded, used and released again. That keeps about 0.7 GB of graphics memory
+// free for the image model.
 async function cachedPrompt(prompt) {
   const cached = promptCache.get(prompt);
   if (cached) return cached;
-  const encoded = await encodePrompt(ort, sessions.text_encoder, tokenizer, prompt);
+  const reader = await ensureSession('text_encoder');
+  let encoded;
+  try {
+    encoded = await encodePrompt(ort, reader, tokenizer, prompt);
+  } finally {
+    await closeSession('text_encoder');
+  }
   promptCache.set(prompt, encoded);
-  if (promptCache.size > 6) promptCache.delete(promptCache.keys().next().value);
+  if (promptCache.size > 8) promptCache.delete(promptCache.keys().next().value);
   return encoded;
 }
 
 async function generate({ prompt, steps, seed }) {
-  if (!sessions) throw new EngineError('not_loaded', 'The engine is not loaded.');
+  if (!ort || !tokenizer) throw new EngineError('not_loaded', 'The engine is not loaded.');
   const text = String(prompt || '').trim();
   if (!text) throw new EngineError('empty_prompt', 'Write a prompt first.');
   cancelGeneration = false;
@@ -502,8 +522,13 @@ async function generate({ prompt, steps, seed }) {
     timing.prompt = performance.now() - started;
     checkCancelled();
 
+    const loadStart = performance.now();
+    const unet = await ensureSession('unet');
+    timing.load = performance.now() - loadStart;
+    checkCancelled();
+
     const denoiseStart = performance.now();
-    const latents = await denoise(ort, sessions.unet, encoded, {
+    const latents = await denoise(ort, unet, encoded, {
       steps,
       seed,
       latentSize: LATENT,
@@ -513,9 +538,10 @@ async function generate({ prompt, steps, seed }) {
     if (!latents) throw new EngineError('cancelled', 'Stopped.');
     timing.denoise = performance.now() - denoiseStart;
 
+    const decoder = await ensureSession('vae_decoder');
     emit('gen-progress', { stage: 'decode', step: steps, steps });
     const decodeStart = performance.now();
-    const { rgba, width, height } = await decode(ort, sessions.vae_decoder, latents, LATENT);
+    const { rgba, width, height } = await decode(ort, decoder, latents, LATENT);
     const canvas = new OffscreenCanvas(width, height);
     canvas.getContext('2d').putImageData(new ImageData(rgba, width, height), 0, 0);
     const blob = await canvas.convertToBlob({ type: 'image/png' });
@@ -533,11 +559,14 @@ async function generate({ prompt, steps, seed }) {
       promptTruncated: encoded.truncated,
     };
   } catch (err) {
-    if (err instanceof EngineError) throw err;
+    if (err instanceof EngineError) {
+      if (err.code === 'memory') await unload();
+      throw err;
+    }
     const textErr = String(err && err.message || err);
     if (/lost|destroyed|memory|alloc/i.test(textErr)) {
       // The graphics device is gone; the sessions cannot be reused.
-      sessions = null;
+      sessions = {};
       promptCache.clear();
       throw new EngineError('device_lost', 'The graphics chip ran out of memory or was reset.', textErr);
     }
@@ -574,7 +603,7 @@ const commands = {
     if (downloadAbort) downloadAbort.abort();
     return {};
   },
-  load: () => load(),
+  load: () => ensureRuntime(),
   unload: async () => { await unload(); return {}; },
   generate: (payload) => generate(payload),
   cancel() {

@@ -22,9 +22,9 @@ const EXAMPLES = [
   'A bowl of ramen on a wooden counter, steam rising, window light',
 ];
 
-const BUILD = '2';
+const BUILD = '3';
 const SETTINGS_KEY = 'pocketframe.settings';
-const LOADING_FLAG = 'pocketframe.loading';
+const STAGE_KEY = 'pocketframe.stage';
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -47,10 +47,10 @@ const state = {
   status: null,
   totalBytes: 0,
   download: { have: 0, total: 0, speed: 0, retrying: false },
-  loadStage: { stage: 'runtime', done: 0, of: 3 },
   engineError: null, // { code, message, detail, retry }
-  crashHint: false,
-  working: null, // { index, count, stage, step, steps }
+  crashInfo: null, // what the page was doing if it closed unexpectedly last time
+  lastCrash: null,
+  working: null, // { index, count, stage, step, steps, model }
   stopRequested: false,
   genError: null,
   frames: [],
@@ -96,6 +96,29 @@ function writeStorage(key, value) {
     if (value === null) localStorage.removeItem(key);
     else localStorage.setItem(key, value);
   } catch { /* private mode: carry on without it */ }
+}
+
+// A note of what the page is doing right now, kept where it survives a crash.
+// If the browser closes the page mid-task, the next visit can say where.
+function markStage(info) {
+  writeStorage(STAGE_KEY, info ? JSON.stringify({ ...info, build: BUILD, at: Date.now() }) : null);
+}
+
+const MODEL_NAMES = { text_encoder: 'prompt reader', unet: 'image model', vae_decoder: 'image decoder' };
+
+function describeStage(info) {
+  if (!info) return '';
+  if (info.stage === 'engine') return 'starting the engine';
+  if (info.stage === 'prompt') return 'reading the prompt';
+  if (info.stage === 'model') {
+    const name = MODEL_NAMES[info.key] || 'model';
+    if (info.phase === 'read') return `preparing the ${name}`;
+    if (info.phase === 'done') return `just after loading the ${name}`;
+    return `loading the ${name} (${formatBytes(info.sent || 0)} of ${formatBytes(info.total || 0)} sent to the graphics chip)`;
+  }
+  if (info.stage === 'denoise') return `forming the image (step ${info.step} of ${info.steps})`;
+  if (info.stage === 'decode') return 'turning the image into pixels';
+  return 'working';
 }
 
 let toastTimer = 0;
@@ -259,13 +282,16 @@ function onEngineEvent(data) {
     state.download = { have: data.have, total: data.total, speed: data.speed || 0, retrying: !!data.retrying };
     updateProgress();
     renderEngineButton();
-  } else if (data.event === 'load-progress') {
-    state.loadStage = { stage: data.stage, done: data.done, of: data.of };
+  } else if (data.event === 'model-progress' && state.working) {
+    state.working.model = data.phase === 'done' ? null : { key: data.key, phase: data.phase, sent: data.sent, total: data.total };
+    markStage({ stage: 'model', key: data.key, phase: data.phase, sent: data.sent, total: data.total });
     updateProgress();
   } else if (data.event === 'gen-progress' && state.working) {
     state.working.stage = data.stage;
     state.working.step = data.step;
     state.working.steps = data.steps;
+    state.working.model = null;
+    markStage({ stage: data.stage, step: data.step, steps: data.steps });
     updateProgress();
   }
 }
@@ -297,10 +323,14 @@ async function boot() {
   state.frames = await library.all();
   state.currentId = state.frames[0]?.id ?? null;
 
-  if (readStorage(LOADING_FLAG)) {
-    state.crashHint = true;
-    writeStorage(LOADING_FLAG, null);
-  }
+  try {
+    const left = JSON.parse(readStorage(STAGE_KEY) || 'null');
+    if (left) {
+      state.crashInfo = left;
+      state.lastCrash = left;
+    }
+  } catch { /* unreadable note: ignore it */ }
+  markStage(null);
 
   let init;
   try {
@@ -331,7 +361,7 @@ async function refreshStatus() {
 
 async function startDownload() {
   state.download = { have: state.status?.have || 0, total: state.totalBytes, speed: 0, retrying: false };
-  state.crashHint = false;
+  state.crashInfo = null;
   setEngine('downloading');
   try { navigator.storage?.persist?.(); } catch { /* optional */ }
   await wake.acquire();
@@ -356,20 +386,19 @@ async function pauseDownload() {
 }
 
 async function startEngine() {
-  state.loadStage = { stage: 'runtime', done: 0, of: 3 };
-  state.crashHint = false;
+  state.crashInfo = null;
   setEngine('loading');
-  writeStorage(LOADING_FLAG, String(Date.now()));
+  markStage({ stage: 'engine' });
   await wake.acquire();
   try {
     await call('load');
     state.firstSinceLoad = true;
-    writeStorage(LOADING_FLAG, null);
+    markStage(null);
     wake.release();
     setEngine('ready');
     return true;
   } catch (error) {
-    writeStorage(LOADING_FLAG, null);
+    markStage(null);
     wake.release();
     await refreshStatus();
     setEngineError(error, error.code === 'not_downloaded' ? 'download' : 'load');
@@ -379,7 +408,8 @@ async function startEngine() {
 
 async function unloadEngine() {
   try { await call('unload'); } catch { /* nothing loaded */ }
-  if (state.engine === 'ready') setEngine('downloaded');
+  state.firstSinceLoad = true;
+  render();
 }
 
 async function deleteModel() {
@@ -414,6 +444,7 @@ async function runBatch() {
     return;
   }
   state.genError = null;
+  state.crashInfo = null;
   state.peek = false;
   state.truncatedWarning = false;
 
@@ -432,7 +463,8 @@ async function runBatch() {
   for (let i = 0; i < count; i++) {
     if (state.stopRequested) break;
     const seed = baseSeed === null ? randomSeed() : (baseSeed + i) >>> 0;
-    state.working = { index: i + 1, count, stage: 'prompt', step: 0, steps };
+    state.working = { index: i + 1, count, stage: 'prompt', step: 0, steps, model: null };
+    markStage({ stage: 'prompt' });
     render();
     try {
       const result = await call('generate', { prompt, steps, seed });
@@ -454,13 +486,15 @@ async function runBatch() {
     } catch (error) {
       if (error.code !== 'cancelled') {
         state.genError = error;
-        if (error.code === 'device_lost' || error.code === 'not_loaded') state.engine = 'downloaded';
+        if (error.code === 'device_lost' || error.code === 'memory') state.firstSinceLoad = true;
+        if (error.code === 'not_loaded') state.engine = 'downloaded';
       }
       break;
     }
   }
 
   state.working = null;
+  markStage(null);
   wake.release();
   render();
 }
@@ -509,8 +543,8 @@ function checksHtml() {
 }
 
 function crashHintHtml() {
-  return state.crashHint
-    ? '<p><strong>Last time the page closed while loading the model.</strong> That usually means the phone ran short of memory. Close other apps and browser tabs before trying again.</p>'
+  return state.crashInfo
+    ? `<p><strong>Last time the page closed while ${escapeHtml(describeStage(state.crashInfo))}.</strong> That usually means the device ran short of memory. Close other apps and browser tabs before trying again.</p>`
     : '';
 }
 
@@ -532,13 +566,23 @@ function printView() {
       key: `work:${state.working.index}`,
       html: `<div class="print-note"><h2>${title}</h2><p id="workStage"></p>
         <div class="meter"><span id="workMeter"></span></div>
-        ${state.firstSinceLoad ? '<p>The first photo after loading is the slowest while the graphics chip warms up.</p>' : ''}</div>`,
+        ${state.firstSinceLoad ? '<p>The first photo takes the longest: the model has to load onto the graphics chip first.</p>' : ''}</div>`,
+    };
+  }
+
+  if (state.crashInfo && !state.peek && state.engine !== 'checking' && state.engine !== 'unsupported') {
+    return {
+      key: 'crash',
+      html: `<div class="print-note"><h2>The page closed unexpectedly last time</h2>
+        <p>It happened while <strong>${escapeHtml(describeStage(state.crashInfo))}</strong>.</p>
+        <p>That usually means the device ran short of memory. Close other apps and browser tabs, then generate again.</p>
+        <button class="btn btn-paper-outline" type="button" data-action="dismiss-crash">OK</button></div>`,
     };
   }
 
   if (state.genError) {
     const err = state.genError;
-    const lost = err.code === 'device_lost';
+    const lost = err.code === 'device_lost' || err.code === 'memory';
     return {
       key: `generr:${err.code}`,
       html: `<div class="print-note"><h2>${lost ? 'The graphics chip ran out of memory' : 'That photo failed'}</h2>
@@ -591,10 +635,9 @@ function printView() {
     case 'loading':
       return {
         key: 'loading',
-        html: `<div class="print-note"><h2>Loading the model</h2>
-          <p id="loadStage"></p>
+        html: `<div class="print-note"><h2>Starting the engine</h2>
           <div class="meter indeterminate"><span></span></div>
-          <p>This happens each time you open Pocketframe. It can take a minute on a phone.</p></div>`,
+          <p>The first time, this fetches about 30 MB of engine code.</p></div>`,
       };
     case 'error': {
       const err = state.engineError;
@@ -613,7 +656,7 @@ function printView() {
   if (frame) return imageView(frame);
 
   return {
-    key: `empty:${state.crashHint}`,
+    key: 'empty',
     html: `<div class="print-note"><h2>Describe a photo to make your first one</h2>${crashHintHtml()}
       <p>Or start from one of these:</p>
       <div class="examples">${EXAMPLES.map((text, i) => `<button class="example" type="button" data-example="${i}">${escapeHtml(text)}</button>`).join('')}</div></div>`,
@@ -660,7 +703,14 @@ function updateProgress() {
       const w = state.working;
       let text = 'Reading the prompt';
       let fraction = 0.04;
-      if (w.stage === 'denoise') {
+      if (w.model) {
+        const name = MODEL_NAMES[w.model.key] || 'model';
+        const share = w.model.total ? w.model.sent / w.model.total : 0;
+        text = w.model.phase === 'read'
+          ? `Preparing the ${name}`
+          : `Loading the ${name}: ${formatBytes(w.model.sent)} of ${formatBytes(w.model.total)}`;
+        fraction = Math.max(0.02, share);
+      } else if (w.stage === 'denoise') {
         text = w.steps > 1 ? `Step ${w.step} of ${w.steps}` : 'Forming the image';
         fraction = 0.1 + (0.7 * (w.step - 1)) / w.steps;
       } else if (w.stage === 'decode') {
@@ -679,13 +729,6 @@ function updateProgress() {
       meter.style.width = `${total ? ((have / total) * 100).toFixed(1) : 0}%`;
       $('dlAmount').textContent = `${formatBytes(have)} of ${formatBytes(total)}`;
       $('dlTime').textContent = retrying ? 'Reconnecting' : timeLeft(total - have, speed);
-    }
-  } else if (state.engine === 'loading') {
-    const line = $('loadStage');
-    if (line) {
-      const names = { runtime: 'Starting the engine', unet: 'Image model', text_encoder: 'Prompt reader', vae_decoder: 'Image decoder', done: 'Finishing' };
-      const { stage, done, of } = state.loadStage;
-      line.textContent = stage === 'runtime' || stage === 'done' ? names[stage] : `Part ${done + 1} of ${of}: ${names[stage] || stage}`;
     }
   }
 }
@@ -780,7 +823,7 @@ function renderPanel() {
   const free = caps.quota ? Math.max(0, caps.quota - caps.usage) : 0;
   const facts = [
     ['Runs on', engineConfig.backend === 'wasm' ? 'Processor (test mode)' : (caps.gpu || 'Graphics chip')],
-    ['Engine', { ready: 'Loaded', loading: 'Loading', downloaded: 'Not loaded', downloading: 'Downloading model', paused: 'Download paused', 'needs-model': 'No model yet', unsupported: 'Not supported', error: 'Problem', checking: 'Checking' }[state.engine]],
+    ['Engine', { ready: 'Started', loading: 'Starting', downloaded: 'Not loaded', downloading: 'Downloading model', paused: 'Download paused', 'needs-model': 'No model yet', unsupported: 'Not supported', error: 'Problem', checking: 'Checking' }[state.engine]],
     ['Photo size', '512 × 512'],
     ['Photos saved here', String(state.frames.length)],
     ['Build', BUILD],
@@ -789,7 +832,8 @@ function renderPanel() {
   if (free) facts.push(['Free space for this site', formatBytes(free)]);
   if (state.lastTiming) {
     const t = state.lastTiming;
-    facts.push(['Last photo', `prompt ${formatSeconds(t.prompt)}, image ${formatSeconds(t.denoise)}, pixels ${formatSeconds(t.decode)}`]);
+    const loading = t.load > 500 ? `model load ${formatSeconds(t.load)}, ` : '';
+    facts.push(['Last photo', `prompt ${formatSeconds(t.prompt)}, ${loading}image ${formatSeconds(t.denoise)}, pixels ${formatSeconds(t.decode)}`]);
   }
   el.facts.innerHTML = facts.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('');
 
@@ -886,6 +930,7 @@ function wireEvents() {
       el.prompt.focus();
       return;
     }
+    if (action === 'dismiss-crash') { state.crashInfo = null; render(); return; }
     if (action === 'download') startDownload();
     else if (action === 'pause') pauseDownload();
     else if (action === 'retry') {
@@ -979,6 +1024,7 @@ function wireEvents() {
       lastTiming: state.lastTiming,
       engineError: state.engineError,
       generateError: state.genError,
+      closedWhile: state.lastCrash ? { ...state.lastCrash, summary: describeStage(state.lastCrash) } : null,
     };
     try {
       await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
