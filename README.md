@@ -26,6 +26,7 @@ add these files at the top level, and open `https://<your-username>.github.io/`.
 | `index.html` | The page and its styles |
 | `app.js` | Interface logic and the photo library (IndexedDB) |
 | `engine.worker.js` | Model download with resume, loading, generation |
+| `onnx-external.js` | Lets the engine read weights straight from the stored model file |
 | `pipeline.js` | The three model passes: prompt, denoise, decode |
 | `sampler.js` | Noise schedule and seeded noise |
 | `clip-tokenizer.js` | Prompt tokenizer |

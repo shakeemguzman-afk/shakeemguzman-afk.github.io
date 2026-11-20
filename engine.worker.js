@@ -4,6 +4,7 @@
 
 import { ClipTokenizer } from './clip-tokenizer.js';
 import { encodePrompt, denoise, decode } from './pipeline.js';
+import { externalizeWeights } from './onnx-external.js';
 
 const ORT_VERSION = '1.31.1';
 const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.webgpu.bundle.min.mjs`;
@@ -365,6 +366,45 @@ async function loadBytes(key) {
   return readStored(FILES.find((f) => f.key === key));
 }
 
+// Reads one stored model as { graph, weights }: a small graph whose weights
+// point into the original file, plus that file's bytes. Loading it this way
+// keeps the engine's own working memory small (see onnx-external.js).
+async function loadModelParts(key) {
+  const file = FILES.find((f) => f.key === key);
+  const location = `${key}.bin`;
+  const access = await openFile(file, false);
+  try {
+    const size = access.getSize();
+    if (size !== file.bytes) {
+      throw new EngineError('not_downloaded', 'The model download is incomplete.');
+    }
+    let graph;
+    try {
+      graph = externalizeWeights((at, length) => {
+        const chunk = new Uint8Array(length);
+        access.read(chunk, { at });
+        return chunk;
+      }, size, location).graph;
+    } catch (err) {
+      throw new EngineError('engine_load', 'A model file could not be read.', String(err && err.message || err));
+    }
+    let weights;
+    try {
+      weights = new Uint8Array(size);
+    } catch {
+      throw new EngineError('memory', 'Not enough free memory to load the model.');
+    }
+    for (let at = 0; at < size; at += READ_SLICE) {
+      const end = Math.min(size, at + READ_SLICE);
+      const got = access.read(weights.subarray(at, end), { at });
+      if (got !== end - at) throw new EngineError('engine_load', 'A model file could not be read back.');
+    }
+    return { graph, weights, location };
+  } finally {
+    access.close();
+  }
+}
+
 async function load() {
   if (sessions) return { loaded: true };
   if (!hasPrivateStorage()) {
@@ -399,9 +439,12 @@ async function load() {
     for (let i = 0; i < SESSION_PLAN.length; i++) {
       const plan = SESSION_PLAN[i];
       emit('load-progress', { stage: plan.key, done: i, of: SESSION_PLAN.length });
-      let bytes = await loadBytes(plan.key);
-      built[plan.key] = await ort.InferenceSession.create(bytes, sessionOptions(plan.overrides));
-      bytes = null; // let the copy in page memory go as soon as the engine has it
+      let parts = await loadModelParts(plan.key);
+      built[plan.key] = await ort.InferenceSession.create(parts.graph, {
+        ...sessionOptions(plan.overrides),
+        externalData: [{ path: parts.location, data: parts.weights }],
+      });
+      parts = null; // let the copy in page memory go as soon as the engine has it
     }
   } catch (err) {
     for (const s of Object.values(built)) {

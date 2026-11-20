@@ -22,6 +22,7 @@ const EXAMPLES = [
   'A bowl of ramen on a wooden counter, steam rising, window light',
 ];
 
+const BUILD = '2';
 const SETTINGS_KEY = 'pocketframe.settings';
 const LOADING_FLAG = 'pocketframe.loading';
 
@@ -782,6 +783,7 @@ function renderPanel() {
     ['Engine', { ready: 'Loaded', loading: 'Loading', downloaded: 'Not loaded', downloading: 'Downloading model', paused: 'Download paused', 'needs-model': 'No model yet', unsupported: 'Not supported', error: 'Problem', checking: 'Checking' }[state.engine]],
     ['Photo size', '512 × 512'],
     ['Photos saved here', String(state.frames.length)],
+    ['Build', BUILD],
   ];
   if (caps.memoryGb) facts.push(['Device memory', caps.memoryGb >= 8 ? '8 GB or more' : `${caps.memoryGb} GB`]);
   if (free) facts.push(['Free space for this site', formatBytes(free)]);
@@ -968,6 +970,7 @@ function wireEvents() {
   confirmTap(el.deleteModelButton, 'Delete 2.5 GB model?', deleteModel);
   el.reportButton.addEventListener('click', async () => {
     const report = {
+      build: BUILD,
       page: location.origin + location.pathname,
       userAgent: navigator.userAgent,
       engine: state.engine,
